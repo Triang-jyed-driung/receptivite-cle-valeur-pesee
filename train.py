@@ -38,6 +38,7 @@ if __name__ == "__main__":
     parser.add_argument("--dim_ffn", default=0, type=int)
     parser.add_argument("--pre_ffn", default=0, type=int)  # replace first att layer by ffn (sometimes better)
     parser.add_argument("--head_qk", default=0, type=int)  # my headQK trick
+    parser.add_argument("--new_residual", default=0.0, type=float)  # my headQK trick
     parser.add_argument("--tiny_att_dim", default=0, type=int)  # tiny attention dim
     parser.add_argument("--tiny_att_layer", default=-999, type=int)  # tiny attention @ which layer
 
@@ -314,6 +315,7 @@ if __name__ == "__main__":
     if "deepspeed" in args.strategy:
         trainer.strategy.config["zero_optimization"]["allgather_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
         trainer.strategy.config["zero_optimization"]["reduce_bucket_size"] = args.ds_bucket_mb * 1000 * 1000
+        trainer.strategy.config["zero_optimization"]["contiguous_gradients"] = False
 
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
     data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
