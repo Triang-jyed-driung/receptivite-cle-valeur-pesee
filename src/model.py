@@ -1,5 +1,8 @@
 # RWKV-7 preview (only for testing)
-
+# from .t import AdaMin
+from .t2 import MultiAdamMini
+# from torch.optim import AdamW
+# from .mini import MyMini
 import os, math, gc, importlib
 import torch
 # torch._C._jit_set_profiling_executor(True)
@@ -327,6 +330,43 @@ class RWKV_Cmix_x070(MyModule):
         k = x + xx * self.time_maa_k
         k = torch.relu(self.key(k)) ** 2
         return self.value(k)
+    
+class RWKV_Cmix_x071(MyModule):
+    def __init__(self, args, layer_id):
+        super().__init__()
+        self.args = args
+        self.layer_id = layer_id
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+
+        with torch.no_grad():
+            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
+            ddd = torch.ones(1, 1, args.n_embd)
+            for i in range(args.n_embd):
+                ddd[0, 0, i] = i / args.n_embd
+            self.time_maa_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+
+        self.key = nn.Linear(args.n_embd, 3*args.n_embd, bias=False)
+        self.value = nn.Linear(3*args.n_embd, args.n_embd, bias=False)
+        self.receptance = nn.Linear(3*args.n_embd, args.n_embd, bias=False)
+        # self.receptance.weight.data.zero_()
+
+    @MyFunction
+    def forward(self, x):
+        xx = self.time_shift(x) - x        
+        k = x + xx * self.time_maa_k
+        k = torch.relu(self.key(k)) ** 2
+        return self.value(k), self.receptance(k)
+    
+class ResidualMix(nn.Module):
+    def __init__(self, res=0.0):
+        super().__init__()
+        self.res = res
+    
+    def forward(self, x, y, c):
+        # classical lemma: x,y,z indep, x,y ~ N(0,1), c any, (x + c*y)/sqrt(c*c + 1) ~ N(0,1)
+        c = c * self.res
+        return (x + c*y)*torch.rsqrt(c*c + 1)
+
 
 class Block(nn.Module):
     def __init__(self, args, layer_id):
@@ -344,7 +384,19 @@ class Block(nn.Module):
                 self.pos_emb_y = nn.Parameter(torch.zeros((args.my_pos_emb,1,args.n_embd)))
 
         self.att = RWKV_Tmix_x070(args, layer_id)
-        self.ffn = RWKV_Cmix_x070(args, layer_id)
+
+        if args.new_residual > 0:
+            self.resmix = ResidualMix(res=args.new_residual)
+            self.main_multipler = 1 / (args.new_residual ** 2 + 1) ** 0.5
+            self.branch_multipler = args.new_residual / (args.new_residual ** 2 + 1) ** 0.5
+            self.ffn = RWKV_Cmix_x071(args, layer_id)
+            if self.layer_id == 0 and self.args.pre_ffn > 0:
+                self.ffnPre = RWKV_Cmix_x071(args, layer_id)
+        else:
+            self.ffn = RWKV_Cmix_x070(args, layer_id)
+            if self.layer_id == 0 and self.args.pre_ffn > 0:
+                self.ffnPre = RWKV_Cmix_x070(args, layer_id)
+        
         
         if args.tiny_att_dim > 0 and self.layer_id == args.tiny_att_layer:
             self.tiny_ln = nn.LayerNorm(args.n_embd)
@@ -366,18 +418,36 @@ class Block(nn.Module):
                 pos_emb = (self.pos_emb_x + self.pos_emb_y).reshape(T+1, -1)[:-1,:]
                 x = x + pos_emb
 
-        if self.args.dropout == 0:
-            if self.layer_id == 0 and args.pre_ffn > 0:
-                x = x + self.ffnPre(self.ln1(x))
+        if self.args.new_residual > 0:
+            if self.args.dropout == 0:
+                if self.layer_id == 0 and args.pre_ffn > 0:
+                    v, r = self.ffnPre(self.ln1(x))
+                    x = self.resmix(x, v, r)
+                else:
+                    x = x * self.main_multipler + self.att(self.ln1(x)) * self.branch_multipler
+                v, r = self.ffn(self.ln2(x))
+                x = self.resmix(x, v, r)
             else:
-                x = x + self.att(self.ln1(x))
-            x = x + self.ffn(self.ln2(x))
+                if self.layer_id == 0 and args.pre_ffn > 0:
+                    v, r = self.ffnPre(self.ln1(x))
+                    x = self.drop0(self.resmix(x, v, r))
+                else:
+                    x = self.drop0(x * self.main_multipler + self.att(self.ln1(x)) * self.branch_multipler)
+                v, r = self.ffn(self.ln2(x))
+                x = self.drop1(self.resmix(x, v, r))
         else:
-            if self.layer_id == 0 and args.pre_ffn > 0:
-                x = self.drop0(x + self.ffnPre(self.ln1(x)))
+            if self.args.dropout == 0:
+                if self.layer_id == 0 and args.pre_ffn > 0:
+                    x = x + self.ffnPre(self.ln1(x))
+                else:
+                    x = x + self.att(self.ln1(x))
+                x = x + self.ffn(self.ln2(x))
             else:
-                x = self.drop0(x + self.att(self.ln1(x)))
-            x = self.drop1(x + self.ffn(self.ln2(x)))
+                if self.layer_id == 0 and args.pre_ffn > 0:
+                    x = self.drop0(x + self.ffnPre(self.ln1(x)))
+                else:
+                    x = self.drop0(x + self.att(self.ln1(x)))
+                x = self.drop1(x + self.ffn(self.ln2(x)))
 
         if args.tiny_att_dim > 0 and self.layer_id == args.tiny_att_layer:
             xx = self.tiny_ln(x)
@@ -439,6 +509,19 @@ class RWKV(pl.LightningModule):
         if args.dropout > 0:
             self.drop0 = nn.Dropout(p = args.dropout)
 
+    # def configure_optimizers(self):
+    #     weight_decay_cond = lambda name, param: (len(param.squeeze().shape) >= 2)
+    #     logging_fn = lambda term: wandb.log(term, commit=False)
+    #     return MyMini(
+    #         model=self, 
+    #         lr=self.args.lr_init, 
+    #         betas=self.args.betas, 
+    #         eps=self.args.adam_eps, 
+    #         weight_decay=self.args.weight_decay,
+    #         weight_decay_condition=weight_decay_cond,
+    #         logging_fn=logging_fn,
+    #         logging_steps=40)
+    
     def configure_optimizers(self):
         args = self.args
         
@@ -490,12 +573,16 @@ class RWKV(pl.LightningModule):
         param_dict = {n: p for n, p in self.named_parameters()}
         
         optim_groups = [{"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0}]
+        # optim_groups = [{"params": [param_dict[n]], "weight_decay": 0.0, "my_lr_scale": 1.0} for n in lr_1x]
 
         # if args.weight_decay > 0:
         optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
-        if self.deepspeed_offload:
-            return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-        return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
+        # optim_groups += [{"params": [param_dict[n]], "weight_decay": args.weight_decay, "my_lr_scale": 1.0} for n in lr_decay]
+        # return AdamW(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps)
+        return MultiAdamMini(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, foreach=True, fused=False)
+        # if self.deepspeed_offload:
+            # return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
+        # return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
     
         # return ZeroOneAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
 

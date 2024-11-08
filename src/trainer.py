@@ -88,7 +88,7 @@ class train_callback(pl.Callback):
             if param_group["weight_decay"] > 0:
                 param_group["weight_decay"] = wd_now
             if args.layerwise_lr > 0:
-                param_group["lr"] = lr * param_group["my_lr_scale"]
+                param_group["lr"] = lr # * param_group["my_lr_scale"]
                 # print(param_group["lr"], param_group["my_lr_scale"])
             else:
                 param_group["lr"] = lr
